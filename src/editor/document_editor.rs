@@ -729,6 +729,25 @@ impl DocumentEditor {
         id
     }
 
+    /// Decrypt a stream object if the document is encrypted.
+    ///
+    /// For encrypted documents, stream data must be decrypted before being
+    /// written to a new PDF. This helper handles that transparently.
+    fn decrypt_stream_if_needed(&self, obj: Object, obj_ref: ObjectRef) -> Object {
+        if let Object::Stream { ref dict, .. } = obj {
+            if let Ok(decrypted_data) = self.source.decode_stream_with_encryption(&obj, obj_ref) {
+                Object::Stream {
+                    dict: dict.clone(),
+                    data: decrypted_data.into(),
+                }
+            } else {
+                obj
+            }
+        } else {
+            obj
+        }
+    }
+
     /// Apply page property modifications to a page object.
     ///
     /// Returns a new page object with the modifications applied.
@@ -1043,6 +1062,7 @@ impl DocumentEditor {
         let final_page = self.deep_import_object(
             source,
             &stripped_page,
+            None,  // No reference - page object is passed directly
             &mut id_map,
             &mut collected,
             &mut HashSet::new(),
@@ -1059,10 +1079,13 @@ impl DocumentEditor {
     /// When an `Object::Reference` is encountered, the referenced object is
     /// loaded from the source document, assigned a new ID, and recursively
     /// imported. The reference is rewritten to point to the new ID.
+    ///
+    /// For encrypted source documents, stream data is decrypted during import.
     fn deep_import_object(
         &mut self,
         source: &mut PdfDocument,
         obj: &Object,
+        obj_ref: Option<ObjectRef>,  // NEW: optional reference for stream decryption
         id_map: &mut HashMap<u32, u32>,
         collected: &mut Vec<(u32, Object)>,
         visiting: &mut HashSet<u32>,
@@ -1090,7 +1113,7 @@ impl DocumentEditor {
                 // Load and recursively import the referenced object
                 let loaded = source.load_object(*obj_ref)?;
                 let remapped =
-                    self.deep_import_object(source, &loaded, id_map, collected, visiting)?;
+                    self.deep_import_object(source, &loaded, Some(*obj_ref), id_map, collected, visiting)?;
 
                 visiting.remove(&obj_ref.id);
 
@@ -1103,7 +1126,7 @@ impl DocumentEditor {
                 let mut new_dict = HashMap::with_capacity(dict.len());
                 for (key, value) in dict {
                     let new_value =
-                        self.deep_import_object(source, value, id_map, collected, visiting)?;
+                        self.deep_import_object(source, value, None, id_map, collected, visiting)?;
                     new_dict.insert(key.clone(), new_value);
                 }
                 Ok(Object::Dictionary(new_dict))
@@ -1112,21 +1135,31 @@ impl DocumentEditor {
                 let mut new_arr = Vec::with_capacity(arr.len());
                 for item in arr {
                     let new_item =
-                        self.deep_import_object(source, item, id_map, collected, visiting)?;
+                        self.deep_import_object(source, item, None, id_map, collected, visiting)?;
                     new_arr.push(new_item);
                 }
                 Ok(Object::Array(new_arr))
             },
             Object::Stream { dict, data } => {
+                // Decrypt stream data if we have the object reference and source is encrypted
+                let decrypted_data = if let Some(ref obj_ref_val) = obj_ref {
+                    match source.decode_stream_with_encryption(obj, *obj_ref_val) {
+                        Ok(decrypted) => decrypted,
+                        Err(_) => data.to_vec(), // Fall back to original if decryption fails
+                    }
+                } else {
+                    data.to_vec()
+                };
+
                 let mut new_dict = HashMap::with_capacity(dict.len());
                 for (key, value) in dict {
                     let new_value =
-                        self.deep_import_object(source, value, id_map, collected, visiting)?;
+                        self.deep_import_object(source, value, None, id_map, collected, visiting)?;
                     new_dict.insert(key.clone(), new_value);
                 }
                 Ok(Object::Stream {
                     dict: new_dict,
-                    data: data.clone(),
+                    data: decrypted_data.into(),
                 })
             },
             // Primitive types need no remapping
@@ -1419,6 +1452,32 @@ impl DocumentEditor {
         Err(Error::InvalidPdf("Could not find startxref in original PDF".to_string()))
     }
 
+    /// Collect all object references in the document based on the xref table.
+    /// This ensures we write exactly the objects that were in the original PDF.
+    /// Skips compressed objects (they're embedded in object streams).
+    fn collect_all_object_refs(&mut self) -> Result<HashSet<ObjectRef>> {
+        let mut refs = HashSet::new();
+
+        // Get all object IDs from the xref table
+        for obj_id in self.source.get_all_object_ids() {
+            // Skip object 0 (always free)
+            if obj_id == 0 {
+                continue;
+            }
+            
+            // Get the xref entry to check if it's in use and get generation
+            if let Some((gen, in_use, is_compressed)) = self.source.get_xref_entry(obj_id) {
+                // Skip compressed objects - they're embedded in object streams
+                // and will be handled when we write the object stream
+                if in_use && !is_compressed {
+                    refs.insert(ObjectRef::new(obj_id, gen));
+                }
+            }
+        }
+
+        Ok(refs)
+    }
+
     /// Write a full rewrite of the PDF.
     #[cfg(not(target_arch = "wasm32"))]
     fn write_full(
@@ -1485,16 +1544,49 @@ impl DocumentEditor {
         };
 
         // Helper to serialize with or without encryption
+        // IMPORTANT: For encrypted source PDFs, we decrypt streams but preserve compression
         let serialize_obj = |s: &ObjectSerializer,
                              id: u32,
                              gen: u16,
                              obj: &Object,
-                             handler: &Option<EncryptionWriteHandler>|
+                             handler: &Option<EncryptionWriteHandler>,
+                             source: &crate::PdfDocument|
          -> Vec<u8> {
-            if let Some(ref h) = handler {
-                s.serialize_indirect_encrypted(id, gen, obj, h)
+            // For streams from encrypted PDFs, decrypt but keep compressed
+            let obj_to_serialize = if let Object::Stream { ref dict, ref data, .. } = obj {
+                // Check if source is encrypted and we need to decrypt
+                if source.is_encrypted() {
+                    // Decrypt the stream data (but don't decompress)
+                    match source.decrypt_stream_data(data, id, gen as u32) {
+                        Ok(decrypted_data) => {
+                            // Update /Length to match decrypted data size
+                            let mut updated_dict = dict.clone();
+                            updated_dict.insert("Length".to_string(), Object::Integer(decrypted_data.len() as i64));
+                            
+                            // Use decrypted data with updated dictionary (preserves /Filter)
+                            Object::Stream {
+                                dict: updated_dict,
+                                data: decrypted_data.into(),
+                            }
+                        }
+                        Err(_) => {
+                            // Decryption failed, use original data
+                            obj.clone()
+                        }
+                    }
+                } else {
+                    // Not encrypted, use as-is
+                    obj.clone()
+                }
             } else {
-                s.serialize_indirect(id, gen, obj)
+                obj.clone()
+            };
+
+            // Now serialize (possibly encrypting for output if handler is set)
+            if let Some(ref h) = handler {
+                s.serialize_indirect_encrypted(id, gen, &obj_to_serialize, h)
+            } else {
+                s.serialize_indirect(id, gen, &obj_to_serialize)
             }
         };
 
@@ -1669,7 +1761,7 @@ impl DocumentEditor {
                 };
                 let offset = writer.stream_position()?;
                 let bytes =
-                    serialize_obj(&serializer, stream_id, 0, &stream_obj, &encryption_handler);
+                    serialize_obj(&serializer, stream_id, 0, &stream_obj, &encryption_handler, &self.source);
                 writer.write_all(&bytes)?;
                 xref_entries.push((stream_id, offset, 0, true));
 
@@ -1682,7 +1774,7 @@ impl DocumentEditor {
                 let filespec_obj = Object::Dictionary(filespec_dict);
                 let offset = writer.stream_position()?;
                 let bytes =
-                    serialize_obj(&serializer, filespec_id, 0, &filespec_obj, &encryption_handler);
+                    serialize_obj(&serializer, filespec_id, 0, &filespec_obj, &encryption_handler, &self.source);
                 writer.write_all(&bytes)?;
                 xref_entries.push((filespec_id, offset, 0, true));
 
@@ -1727,7 +1819,7 @@ impl DocumentEditor {
 
         let offset = writer.stream_position()?;
         let bytes =
-            serialize_obj(&serializer, catalog_ref.id, 0, &catalog_obj, &encryption_handler);
+            serialize_obj(&serializer, catalog_ref.id, 0, &catalog_obj, &encryption_handler, &self.source);
         writer.write_all(&bytes)?;
         xref_entries.push((catalog_ref.id, offset, 0, true));
 
@@ -1783,36 +1875,40 @@ impl DocumentEditor {
                     0,
                     &final_pages_obj,
                     &encryption_handler,
+                    &self.source,
                 );
                 writer.write_all(&bytes)?;
                 xref_entries.push((pages_ref.id, offset, 0, true));
 
-                // Write individual pages
+                // Write individual pages - use recursive traversal for hierarchical page trees
                 if let Some(pages_dict) = pages_obj.as_dict() {
                     if let Some(kids) = pages_dict.get("Kids").and_then(|k| k.as_array()) {
+                        // Recursively collect all page references (handles nested Pages nodes)
+                        let mut all_page_refs: Vec<ObjectRef> = Vec::new();
+                        self.collect_page_refs(kids, &mut all_page_refs)?;
+                        
                         let mut page_index = 0;
-                        for kid in kids {
-                            if let Some(page_ref) = kid.as_reference() {
-                                let page_obj = self.source.load_object(page_ref)?;
+                        for page_ref in all_page_refs {
+                            let page_obj = self.source.load_object(page_ref)?;
 
-                                // Check if we have erase overlays for this page
-                                let has_erase_overlay =
-                                    self.erase_regions.contains_key(&page_index);
-                                let erase_overlay_id = if has_erase_overlay {
-                                    Some(self.allocate_object_id())
-                                } else {
-                                    None
-                                };
+                            // Check if we have erase overlays for this page
+                            let has_erase_overlay =
+                                self.erase_regions.contains_key(&page_index);
+                            let erase_overlay_id = if has_erase_overlay {
+                                Some(self.allocate_object_id())
+                            } else {
+                                None
+                            };
 
-                                // Check if we have new annotations to add for this page
-                                let new_annotation_count = self
-                                    .modified_annotations
-                                    .get(&page_index)
-                                    .map(|anns| anns.iter().filter(|a| a.is_new()).count())
-                                    .unwrap_or(0);
-                                let new_annotation_ids: Vec<u32> = (0..new_annotation_count)
-                                    .map(|_| self.allocate_object_id())
-                                    .collect();
+                            // Check if we have new annotations to add for this page
+                            let new_annotation_count = self
+                                .modified_annotations
+                                .get(&page_index)
+                                .map(|anns| anns.iter().filter(|a| a.is_new()).count())
+                                .unwrap_or(0);
+                            let new_annotation_ids: Vec<u32> = (0..new_annotation_count)
+                                .map(|_| self.allocate_object_id())
+                                .collect();
 
                                 // Get pre-allocated form field data for this page
                                 // Only include terminal fields (not parent-only) that have widgets
@@ -2237,6 +2333,7 @@ impl DocumentEditor {
                                     0,
                                     &final_page_obj,
                                     &encryption_handler,
+                                    &self.source,
                                 );
                                 writer.write_all(&bytes)?;
                                 xref_entries.push((page_ref.id, offset, 0, true));
@@ -2270,6 +2367,7 @@ impl DocumentEditor {
                                                     0,
                                                     &xobj_stream,
                                                     &encryption_handler,
+                                                    &self.source,
                                                 );
                                                 writer.write_all(&bytes)?;
                                                 xref_entries.push((xobj_id, offset, 0, true));
@@ -2295,6 +2393,7 @@ impl DocumentEditor {
                                                     0,
                                                     &content_stream_obj,
                                                     &encryption_handler,
+                                                    &self.source,
                                                 );
                                                 writer.write_all(&bytes)?;
                                                 xref_entries.push((content_id, offset, 0, true));
@@ -2318,7 +2417,7 @@ impl DocumentEditor {
                                                             .source
                                                             .load_object(*contents_ref)?;
                                                         if let Ok(content_data) =
-                                                            contents_obj.decode_stream_data()
+                                                            self.source.decode_stream_with_encryption(&contents_obj, *contents_ref)
                                                         {
                                                             let mods = self
                                                                 .image_modifications
@@ -2336,33 +2435,38 @@ impl DocumentEditor {
                                                                         0,
                                                                         &modified_stream,
                                                                         &encryption_handler,
+                                                                        &self.source,
                                                                     );
                                                                     writer.write_all(&bytes)?;
                                                                     xref_entries.push((contents_ref.id, offset, 0, true));
                                                                 }
                                                                 Err(_) => {
-                                                                    // Fallback to original content on error
+                                                                    // Fallback to original content on error - but decrypt if needed
+                                                                    let decrypted_obj = self.decrypt_stream_if_needed(contents_obj, *contents_ref);
                                                                     let offset = writer.stream_position()?;
                                                                     let bytes = serialize_obj(&serializer,
                                                                         contents_ref.id,
                                                                         0,
-                                                                        &contents_obj,
+                                                                        &decrypted_obj,
                                                                         &encryption_handler,
+                                                                        &self.source,
                                                                     );
                                                                     writer.write_all(&bytes)?;
                                                                     xref_entries.push((contents_ref.id, offset, 0, true));
                                                                 }
                                                             }
                                                         } else {
-                                                            // Can't decode, write original
+                                                            // Can't decode, write original - but decrypt if needed
+                                                            let decrypted_obj = self.decrypt_stream_if_needed(contents_obj, *contents_ref);
                                                             let offset =
                                                                 writer.stream_position()?;
                                                             let bytes = serialize_obj(
                                                                 &serializer,
                                                                 contents_ref.id,
                                                                 0,
-                                                                &contents_obj,
+                                                                &decrypted_obj,
                                                                 &encryption_handler,
+                                                                &self.source,
                                                             );
                                                             writer.write_all(&bytes)?;
                                                             xref_entries.push((
@@ -2386,7 +2490,7 @@ impl DocumentEditor {
                                                                     .source
                                                                     .load_object(*ref_obj)?;
                                                                 if let Ok(content_data) =
-                                                                    stream_obj.decode_stream_data()
+                                                                    self.source.decode_stream_with_encryption(&stream_obj, *ref_obj)
                                                                 {
                                                                     match self.rewrite_content_stream_with_image_mods(&content_data, mods) {
                                                                         Ok(modified_content) => {
@@ -2400,31 +2504,38 @@ impl DocumentEditor {
                                                                                 0,
                                                                                 &modified_stream,
                                                                                 &encryption_handler,
+                                                                                &self.source,
                                                                             );
                                                                             writer.write_all(&bytes)?;
                                                                             xref_entries.push((ref_obj.id, offset, 0, true));
                                                                         }
                                                                         Err(_) => {
+                                                                            // Fallback - decrypt if needed
+                                                                            let decrypted_obj = self.decrypt_stream_if_needed(stream_obj, *ref_obj);
                                                                             let offset = writer.stream_position()?;
                                                                             let bytes = serialize_obj(&serializer,
                                                                                 ref_obj.id,
                                                                                 0,
-                                                                                &stream_obj,
+                                                                                &decrypted_obj,
                                                                                 &encryption_handler,
+                                                                                &self.source,
                                                                             );
                                                                             writer.write_all(&bytes)?;
                                                                             xref_entries.push((ref_obj.id, offset, 0, true));
                                                                         }
                                                                     }
                                                                 } else {
+                                                                    // Can't decode - decrypt if needed
+                                                                    let decrypted_obj = self.decrypt_stream_if_needed(stream_obj, *ref_obj);
                                                                     let offset =
                                                                         writer.stream_position()?;
                                                                     let bytes = serialize_obj(
                                                                         &serializer,
                                                                         ref_obj.id,
                                                                         0,
-                                                                        &stream_obj,
+                                                                        &decrypted_obj,
                                                                         &encryption_handler,
+                                                                        &self.source,
                                                                     );
                                                                     writer.write_all(&bytes)?;
                                                                     xref_entries.push((
@@ -2438,13 +2549,14 @@ impl DocumentEditor {
                                                 }
                                             }
                                         } else {
-                                            // Use original contents
+                                            // Use original contents - serialize_obj will handle decryption
                                             if let Some(contents_ref) = page_dict
                                                 .get("Contents")
                                                 .and_then(|c| c.as_reference())
                                             {
                                                 let contents_obj =
                                                     self.source.load_object(contents_ref)?;
+                                                
                                                 let offset = writer.stream_position()?;
                                                 let bytes = serialize_obj(
                                                     &serializer,
@@ -2452,6 +2564,7 @@ impl DocumentEditor {
                                                     0,
                                                     &contents_obj,
                                                     &encryption_handler,
+                                                    &self.source,
                                                 );
                                                 writer.write_all(&bytes)?;
                                                 xref_entries.push((
@@ -2464,86 +2577,8 @@ impl DocumentEditor {
                                         }
                                     }
 
-                                    // Write resources if present (as reference)
-                                    if let Some(resources_ref) =
-                                        page_dict.get("Resources").and_then(|r| r.as_reference())
-                                    {
-                                        let resources_obj =
-                                            self.source.load_object(resources_ref)?;
-                                        let offset = writer.stream_position()?;
-                                        let bytes = serialize_obj(
-                                            &serializer,
-                                            resources_ref.id,
-                                            0,
-                                            &resources_obj,
-                                            &encryption_handler,
-                                        );
-                                        writer.write_all(&bytes)?;
-                                        xref_entries.push((resources_ref.id, offset, 0, true));
-                                    }
-
-                                    // Write font objects referenced in Resources (handles inline Resources dict)
-                                    if let Some(resources) = page_dict.get("Resources") {
-                                        let resources_dict = match resources {
-                                            Object::Dictionary(d) => Some(d.clone()),
-                                            Object::Reference(r) => self
-                                                .source
-                                                .load_object(*r)
-                                                .ok()
-                                                .and_then(|o| o.as_dict().cloned()),
-                                            _ => None,
-                                        };
-                                        if let Some(res_dict) = resources_dict {
-                                            // Copy Font dictionary entries
-                                            if let Some(fonts) = res_dict.get("Font") {
-                                                let font_dict = match fonts {
-                                                    Object::Dictionary(d) => Some(d.clone()),
-                                                    Object::Reference(r) => self
-                                                        .source
-                                                        .load_object(*r)
-                                                        .ok()
-                                                        .and_then(|o| o.as_dict().cloned()),
-                                                    _ => None,
-                                                };
-                                                if let Some(fdict) = font_dict {
-                                                    // Rebuild written_ids for O(1) dedup lookups
-                                                    written_ids.clear();
-                                                    written_ids.extend(
-                                                        xref_entries
-                                                            .iter()
-                                                            .map(|(id, _, _, _)| *id),
-                                                    );
-                                                    for (_name, font_ref) in fdict.iter() {
-                                                        if let Some(ref_obj) =
-                                                            font_ref.as_reference()
-                                                        {
-                                                            // Check if we've already written this object
-                                                            if !written_ids.contains(&ref_obj.id) {
-                                                                if let Ok(font_obj) =
-                                                                    self.source.load_object(ref_obj)
-                                                                {
-                                                                    let offset =
-                                                                        writer.stream_position()?;
-                                                                    let bytes = serialize_obj(
-                                                                        &serializer,
-                                                                        ref_obj.id,
-                                                                        0,
-                                                                        &font_obj,
-                                                                        &encryption_handler,
-                                                                    );
-                                                                    writer.write_all(&bytes)?;
-                                                                    xref_entries.push((
-                                                                        ref_obj.id, offset, 0, true,
-                                                                    ));
-                                                                    written_ids.insert(ref_obj.id);
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+                                    // Resources and their dependencies (fonts, xobjects, etc.) 
+                                    // are handled by the comprehensive object collector at the end
                                 }
 
                                 // Write erase overlay content stream if present
@@ -2563,6 +2598,7 @@ impl DocumentEditor {
                                             0,
                                             &overlay_stream,
                                             &encryption_handler,
+                                            &self.source,
                                         );
                                         writer.write_all(&bytes)?;
                                         xref_entries.push((overlay_obj_id, offset, 0, true));
@@ -2597,6 +2633,7 @@ impl DocumentEditor {
                                                     0,
                                                     &Object::Dictionary(annot_dict),
                                                     &encryption_handler,
+                                                    &self.source,
                                                 );
                                                 writer.write_all(&bytes)?;
                                                 xref_entries.push((*annot_id, offset, 0, true));
@@ -2625,6 +2662,7 @@ impl DocumentEditor {
                                             0,
                                             &Object::Dictionary(field_dict),
                                             &encryption_handler,
+                                            &self.source,
                                         );
                                         writer.write_all(&bytes)?;
                                         xref_entries.push((*field_id, offset, 0, true));
@@ -2695,6 +2733,7 @@ impl DocumentEditor {
                                             0,
                                             &form_stream,
                                             &encryption_handler,
+                                            &self.source,
                                         );
                                         writer.write_all(&bytes)?;
                                         xref_entries.push((*obj_id, offset, 0, true));
@@ -2718,6 +2757,7 @@ impl DocumentEditor {
                                         0,
                                         &overlay_stream,
                                         &encryption_handler,
+                                        &self.source,
                                     );
                                     writer.write_all(&bytes)?;
                                     xref_entries.push((overlay_id, offset, 0, true));
@@ -2740,6 +2780,7 @@ impl DocumentEditor {
                                         0,
                                         &overlay_stream,
                                         &encryption_handler,
+                                        &self.source,
                                     );
                                     writer.write_all(&bytes)?;
                                     xref_entries.push((redact_overlay_id, offset, 0, true));
@@ -2811,6 +2852,7 @@ impl DocumentEditor {
                                             0,
                                             &form_stream,
                                             &encryption_handler,
+                                            &self.source,
                                         );
                                         writer.write_all(&bytes)?;
                                         xref_entries.push((*obj_id, offset, 0, true));
@@ -2836,13 +2878,13 @@ impl DocumentEditor {
                                         0,
                                         &overlay_stream,
                                         &encryption_handler,
+                                        &self.source,
                                     );
                                     writer.write_all(&bytes)?;
                                     xref_entries.push((form_overlay_id, offset, 0, true));
                                 }
 
                                 page_index += 1;
-                            }
                         }
                     }
                 }
@@ -2873,7 +2915,7 @@ impl DocumentEditor {
             // Write the page object
             let offset = writer.stream_position()?;
             let bytes =
-                serialize_obj(&serializer, page_id, 0, &final_page_obj, &encryption_handler);
+                serialize_obj(&serializer, page_id, 0, &final_page_obj, &encryption_handler, &self.source);
             writer.write_all(&bytes)?;
             xref_entries.push((page_id, offset, 0, true));
             written_ids.insert(page_id);
@@ -2885,7 +2927,7 @@ impl DocumentEditor {
                     continue;
                 }
                 let offset = writer.stream_position()?;
-                let bytes = serialize_obj(&serializer, *obj_id, 0, obj, &encryption_handler);
+                let bytes = serialize_obj(&serializer, *obj_id, 0, obj, &encryption_handler, &self.source);
                 writer.write_all(&bytes)?;
                 xref_entries.push((*obj_id, offset, 0, true));
                 written_ids.insert(*obj_id);
@@ -2907,6 +2949,7 @@ impl DocumentEditor {
                     0,
                     &Object::Dictionary(field_dict),
                     &encryption_handler,
+                    &self.source,
                 );
                 writer.write_all(&bytes)?;
                 xref_entries.push((*field_id, offset, 0, true));
@@ -2919,13 +2962,41 @@ impl DocumentEditor {
             let info_id = self.allocate_object_id();
             let info_obj = info.to_object();
             let offset = writer.stream_position()?;
-            let bytes = serialize_obj(&serializer, info_id, 0, &info_obj, &encryption_handler);
+            let bytes = serialize_obj(&serializer, info_id, 0, &info_obj, &encryption_handler, &self.source);
             writer.write_all(&bytes)?;
             xref_entries.push((info_id, offset, 0, true));
             Some(ObjectRef::new(info_id, 0))
         } else {
             None
         };
+
+        // COLLECT AND WRITE ALL REMAINING OBJECTS
+        // This ensures we don't miss any objects that weren't handled by the specific handlers above
+        written_ids.clear();
+        written_ids.extend(xref_entries.iter().map(|(id, _, _, _)| *id));
+        
+        // Collect all object references from the document
+        let all_refs = self.collect_all_object_refs()?;
+        
+        // Write any objects we haven't written yet
+        for obj_ref in all_refs {
+            if !written_ids.contains(&obj_ref.id) {
+                if let Ok(obj) = self.source.load_object(obj_ref) {
+                    let offset = writer.stream_position()?;
+                    let bytes = serialize_obj(
+                        &serializer,
+                        obj_ref.id,
+                        obj_ref.gen,
+                        &obj,
+                        &encryption_handler,
+                        &self.source,
+                    );
+                    writer.write_all(&bytes)?;
+                    xref_entries.push((obj_ref.id, offset, obj_ref.gen as u16, true));
+                    written_ids.insert(obj_ref.id);
+                }
+            }
+        }
 
         // Sort xref entries by object ID
         xref_entries.sort_by_key(|(id, _, _, _)| *id);
@@ -4742,11 +4813,12 @@ impl DocumentEditor {
         // Get content stream bytes
         let content_bytes = if let Some(ref_obj) = appearance_ref {
             let stream_obj = self.source.load_object(ref_obj)?;
-            match stream_obj.decode_stream_data() {
+            match self.source.decode_stream_with_encryption(&stream_obj, ref_obj) {
                 Ok(data) => data,
                 Err(_) => return Ok(None),
             }
         } else {
+            // Inline appearance - try direct decode (encryption handled at parent object level)
             match appearance_obj.decode_stream_data() {
                 Ok(data) => data,
                 Err(_) => return Ok(None),
@@ -4958,17 +5030,17 @@ impl DocumentEditor {
 
             // Get the content stream bytes
             let content_bytes = if let Some(ref_obj) = appearance_ref {
-                // Load the object and decode its stream data
+                // Load the object and decode its stream data (with encryption support)
                 let stream_obj = match self.source.load_object(ref_obj) {
                     Ok(obj) => obj,
                     Err(_) => continue,
                 };
-                match stream_obj.decode_stream_data() {
+                match self.source.decode_stream_with_encryption(&stream_obj, ref_obj) {
                     Ok(data) => data,
                     Err(_) => continue,
                 }
             } else {
-                // Inline stream - try to decode directly
+                // Inline stream - try to decode directly (encryption handled at parent object level)
                 match appearance_obj.decode_stream_data() {
                     Ok(data) => data,
                     Err(_) => continue,
@@ -5245,11 +5317,11 @@ impl DocumentEditor {
             None => return Ok(Vec::new()),
         };
 
-        // Load content stream data
+        // Load content stream data (with encryption support)
         let content_data = match contents {
             Object::Reference(ref_obj) => {
                 let obj = self.source.load_object(ref_obj)?;
-                obj.decode_stream_data()?
+                self.source.decode_stream_with_encryption(&obj, ref_obj)?
             },
             Object::Array(arr) => {
                 // Concatenate multiple content streams
@@ -5257,7 +5329,7 @@ impl DocumentEditor {
                 for item in arr {
                     if let Object::Reference(ref_obj) = item {
                         let obj = self.source.load_object(ref_obj)?;
-                        if let Ok(stream_data) = obj.decode_stream_data() {
+                        if let Ok(stream_data) = self.source.decode_stream_with_encryption(&obj, ref_obj) {
                             data.extend_from_slice(&stream_data);
                             data.push(b'\n');
                         }

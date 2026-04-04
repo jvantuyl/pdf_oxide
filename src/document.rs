@@ -143,6 +143,9 @@ pub struct PdfDocument {
     /// Wrapped in RefCell so load_object can take &self (required for safe
     /// access through TextExtractor's *const PdfDocument pointer).
     object_cache: RefCell<HashMap<ObjectRef, Object>>,
+    /// Track objects whose streams have been decrypted/decompressed.
+    /// Used to avoid re-processing streams when serializing encrypted PDFs.
+    processed_streams: RefCell<HashSet<ObjectRef>>,
     /// Track objects being resolved (for cycle detection)
     resolving_stack: RefCell<HashSet<ObjectRef>>,
     /// Current recursion depth
@@ -415,6 +418,7 @@ impl PdfDocument {
             xref,
             trailer,
             object_cache: RefCell::new(HashMap::new()),
+            processed_streams: RefCell::new(HashSet::new()),
             resolving_stack: RefCell::new(HashSet::new()),
             recursion_depth: RefCell::new(0),
             encryption_handler: RefCell::new(None),
@@ -665,6 +669,22 @@ impl PdfDocument {
         }
     }
 
+    /// Check if the PDF is encrypted.
+    pub fn is_encrypted(&self) -> bool {
+        self.encryption_handler.borrow().is_some()
+    }
+
+    /// Decrypt stream data for an object (if encrypted).
+    /// Returns the decrypted data, or the original data if not encrypted.
+    pub fn decrypt_stream_data(&self, data: &[u8], obj_num: u32, gen_num: u32) -> Result<Vec<u8>> {
+        let handler_ref = self.encryption_handler.borrow();
+        if let Some(handler) = handler_ref.as_ref() {
+            handler.decrypt_stream(data, obj_num, gen_num)
+        } else {
+            Ok(data.to_vec())
+        }
+    }
+
     /// Get the PDF version.
     ///
     /// Returns a tuple (major, minor) representing the PDF version.
@@ -806,6 +826,25 @@ impl PdfDocument {
             Some(offset) => Ok(offset),
             None => Err(Error::ObjectNotFound(obj_ref.id, obj_ref.gen)),
         }
+    }
+
+    /// Get a list of all object IDs in the xref table.
+    ///
+    /// This returns all object IDs that are defined in the PDF's cross-reference table,
+    /// including both in-use and free objects.
+    pub fn get_all_object_ids(&self) -> Vec<u32> {
+        self.xref.entries.keys().copied().collect()
+    }
+
+    /// Get the xref entry for a specific object ID.
+    ///
+    /// Returns None if the object is not in the xref table.
+    /// Returns (generation, in_use, is_compressed).
+    pub fn get_xref_entry(&self, obj_id: u32) -> Option<(u16, bool, bool)> {
+        self.xref.entries.get(&obj_id).map(|e| {
+            let is_compressed = matches!(e.entry_type, crate::xref::XRefEntryType::Compressed);
+            (e.generation, e.in_use, is_compressed)
+        })
     }
 
     /// Load an object by its reference.
@@ -1404,8 +1443,8 @@ impl PdfDocument {
             },
         };
 
-        // Cache the object
-        self.object_cache.borrow_mut().insert(obj_ref, obj.clone());
+        // Cache the object - only if not already cached (immutable once cached)
+        self.object_cache.borrow_mut().entry(obj_ref).or_insert_with(|| obj.clone());
 
         Ok(obj)
     }
@@ -1504,7 +1543,8 @@ impl PdfDocument {
                 true
             };
             if should_cache {
-                self.object_cache.borrow_mut().insert(cache_ref, object);
+                // Only cache if not already present (immutable once cached)
+                self.object_cache.borrow_mut().entry(cache_ref).or_insert(object);
             } else {
                 log::debug!(
                     "[cache_debug] NOT caching obj {} from stream {} (xref points elsewhere)",

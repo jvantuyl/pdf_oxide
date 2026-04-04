@@ -152,7 +152,9 @@ impl EncryptionHandler {
         // Decrypt based on algorithm
         match self.algorithm {
             Algorithm::None => Ok(data.to_vec()),
-            Algorithm::RC4_40 | Algorithm::Rc4_128 => Ok(super::rc4::rc4_crypt(&obj_key, data)),
+            Algorithm::RC4_40 | Algorithm::Rc4_128 => {
+                Ok(super::rc4::rc4_crypt(&obj_key, data))
+            },
             Algorithm::Aes128 => {
                 if obj_key.len() < 16 {
                     return Err(Error::InvalidPdf(format!(
